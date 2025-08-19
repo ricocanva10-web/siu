@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 /**
- * SUI AUTO-SELL — FINAL++ (DEX-only, exclude blast.fun) + Auto-TP Harga + GLOBAL master switch
+ * SUI AUTO-SELL — FINAL
  * --------------------------------------------------------------------------------------------
- * MODE 1 (lama): Auto-sell saat BUY via DEX (per token), jual exact amount pembeli.
- * MODE 2 (lama): Auto-TP — jual saat HARGA token >= target (Aftermath quote).
- * MODE 3 (baru): GLOBAL — master switch:
- *   - ON  → set semua token running=true, 1 loop global pantau semuanya (hemat RPC).
- *   - OFF → set semua token running=false.
+ * MODE 1: Auto-sell saat ada BUY via DEX (jual exact amount pembeli)
+ * MODE 2: Auto-TP (jual saat harga >= target Aftermath quote)
+ * MODE 3: GLOBAL walker (pantau semua token running=true)
  *
- * Fokus perbaikan: SWAP selalu via DEX (bukan blast.fun) dengan filter rute ketat.
- * Patch penting: cegah salah-picu saat TX JUAL milik OWNER (self-sell) → TIDAK dianggap BUY.
+ * Perbaikan penting:
+ * - Deteksi buyer GENERIK (pembayaran bisa SUI/USDC/USDT/dll) → FlowX kebaca.
+ * - Whitelist paket DEX (default: FlowX) + blacklist blast.fun.
+ * - Route filter "DEX-only" + opsi fallback agar tidak gagal "No dex-only route".
+ * - Self-sell guard: TX jual milik OWNER tidak dianggap BUY.
  */
 
 import 'dotenv/config';
@@ -25,8 +26,8 @@ import { fromHEX } from '@mysten/sui/utils';
 
 // ===== ENV / CONST =====
 const SUI = '0x2::sui::SUI';
-const HTTP_URL   = process.env.HTTP_URL || 'https://fullnode.mainnet.sui.io:443';
-const PRIVATE_KEY= (process.env.PRIVATE_KEY || '').trim();
+const HTTP_URL    = process.env.HTTP_URL || 'https://fullnode.mainnet.sui.io:443';
+const PRIVATE_KEY = (process.env.PRIVATE_KEY || '').trim();
 if (!PRIVATE_KEY) { console.error('❌ PRIVATE_KEY belum diisi'); process.exit(1); }
 
 const FAST_POLL_MS = Math.max(50, Number(process.env.FAST_POLL_MS || '80'));
@@ -37,8 +38,17 @@ const QUIET_429    = String(process.env.QUIET_429 || 'true').toLowerCase() !== '
 const STRICT_DEX_NAMES = String(process.env.STRICT_DEX_NAMES||'false').toLowerCase()==='true';
 const DEBUG_DEX_MATCH  = String(process.env.DEBUG_DEX_MATCH||'false').toLowerCase()==='true';
 
-const TP_POLL_MS = Math.max(400, Number(process.env.TP_POLL_MS || '1200')); // Auto-TP poll
+const TP_POLL_MS   = Math.max(400, Number(process.env.TP_POLL_MS || '1200'));
 const MULTI_WALKER = String(process.env.MULTI_WALKER||'false').toLowerCase()==='true';
+
+// deteksi pembayaran BUY (agar FlowX kebaca)
+const DETECT_ANY_PAY = String(process.env.DETECT_ANY_PAY || 'false').toLowerCase() === 'true';
+const PAY_COINS = (process.env.DETECT_PAY_COINS || SUI)
+  .split(',').map(s => s.trim()).filter(Boolean);
+const PAY_SET = new Set(PAY_COINS.map(c => c.toLowerCase()));
+
+// allow non-strict route fallback saat swap (hindari "No dex-only route")
+const ALLOW_ROUTE_FALLBACK = String(process.env.ALLOW_ROUTE_FALLBACK||'false').toLowerCase()==='true';
 
 // --- DEX name heuristics (fallback bila tidak pakai whitelist paket) ---
 const DEFAULT_DEX_NAME_LIST = [
@@ -55,12 +65,13 @@ const DEX_NAME_LIST = (process.env.DEX_NAME_LIST||'')
 const DEX_NAME_SET = new Set(DEX_NAME_LIST.length? DEX_NAME_LIST : DEFAULT_DEX_NAME_LIST);
 
 // === Blacklist (EXCLUDE) & whitelist (INCLUDE) paket ===
-// default exclude: blast.fun package id
 const EXCLUDE_PACKAGES = (process.env.EXCLUDE_PACKAGES||
-  '0x779829966a2e8642c310bed79e6ba603e5acd3c31b25d7d4511e2c9303d6e3ef'
+  '0x779829966a2e8642c310bed79e6ba603e5acd3c31b25d7d4511e2c9303d6e3ef' // blast.fun
 ).split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
 
-const DEX_PACKAGES = (process.env.DEX_PACKAGES||'')
+// FlowX package default (kalau .env kosong, otomatis pakai ini)
+const FLOWX_PKG_DEFAULT = '0xba153169476e8c3114962261d1edc70de5ad9781b83cc617ecc8c1923191cae0';
+const DEX_PACKAGES = (process.env.DEX_PACKAGES || FLOWX_PKG_DEFAULT)
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
 // Fallback regex kalau STRICT false & whitelist kosong
@@ -76,7 +87,6 @@ const TOK_PATH   = join(__dirname, 'tokens.json');
 const LOG_PATH   = join(__dirname, 'activity.log');
 
 async function readJsonSafe(p,d){ try{ return JSON.parse(await readFile(p,'utf8')); }catch{ return d; } }
-async function writeJson(p,v){ await writeJsonAtomic(p, v); } // defined below
 async function writeJsonAtomic(p, v){
   const tmp = p + '.tmp';
   await writeFile(tmp, JSON.stringify(v,null,2));
@@ -85,7 +95,10 @@ async function writeJsonAtomic(p, v){
 async function logLine(s){
   const line = `[${new Date().toISOString()}] ${s}\n`;
   try{
-    await appendFile(LOG_PATH,line).catch(async()=>{ await mkdir(dirname(LOG_PATH),{recursive:true}); await appendFile(LOG_PATH,line); });
+    await appendFile(LOG_PATH,line).catch(async()=>{
+      await mkdir(dirname(LOG_PATH),{recursive:true});
+      await appendFile(LOG_PATH,line);
+    });
   }catch{}
 }
 
@@ -109,8 +122,8 @@ function isCoinType(s){ return /^0x[0-9a-fA-F]+::[A-Za-z0-9_]+::[A-Za-z0-9_]+$/.
 async function getBalanceRaw(owner, coinType){ const r=await client.getBalance({ owner, coinType }); return BigInt(r.totalBalance||'0'); }
 function fmtMist(raw){ const s=BigInt(raw).toString().padStart(10,'0'); const i=s.slice(0,-9)||'0', f=s.slice(-9).replace(/0+$/,''); return f?`${i}.${f}`:i; }
 
-// ===== Decimals cache for Auto-TP =====
-const DECIMALS = new Map(); // coinType -> decimals
+// ===== Decimals cache (Auto-TP) =====
+const DECIMALS = new Map();
 async function getDecimals(coinType){
   if (DECIMALS.has(coinType)) return DECIMALS.get(coinType);
   const md = await client.getCoinMetadata({ coinType });
@@ -123,17 +136,15 @@ function pow10(n){ let r=1n; for(let i=0;i<n;i++) r*=10n; return r; }
 // ===== tokens.json =====
 function normalizeCfg(raw={}){
   return {
-    // Lama (oneshot/DEX runner):
     sellPercent: Math.min(100, Math.max(1, toNum(raw.sellPercent, 100))),
     minSellRaw:  toBig(raw.minSellRaw ?? 0),
     cooldownMs:  Math.max(200, toNum(raw.cooldownMs, 900)),
     slippageBps: Math.max(1, Math.min(5000, toNum(raw.slippageBps, 200))),
-    running:     !!raw.running,       // runner DEX-only
+    running:     !!raw.running,
     lastSellMs:  toNum(raw.lastSellMs, 0),
 
-    // Auto-TP:
     tpRunning:      !!raw.tpRunning,
-    tpPriceSui:     Math.max(0, toNum(raw.tpPriceSui, 0)), // target SUI per 1 token
+    tpPriceSui:     Math.max(0, toNum(raw.tpPriceSui, 0)),
     tpSellPercent:  Math.min(100, Math.max(1, toNum(raw.tpSellPercent, 100))),
     tpProbeRaw:     raw.tpProbeRaw ? toBig(raw.tpProbeRaw) : 0n,
     tpLastHitMs:    toNum(raw.tpLastHitMs, 0),
@@ -143,8 +154,11 @@ let TOKENS = new Map();
 async function loadTokens(){
   const data=await readJsonSafe(TOK_PATH,{});
   const map=new Map();
-  if (Array.isArray(data)) for(const it of data) if(it?.coinType&&isCoinType(it.coinType)) map.set(it.coinType, normalizeCfg(it));
-  else if (data && typeof data==='object') for(const [k,v] of Object.entries(data)) if(isCoinType(k)) map.set(k, normalizeCfg(v));
+  if (Array.isArray(data)) {
+    for(const it of data) if(it?.coinType&&isCoinType(it.coinType)) map.set(it.coinType, normalizeCfg(it));
+  } else if (data && typeof data==='object') {
+    for(const [k,v] of Object.entries(data)) if(isCoinType(k)) map.set(k, normalizeCfg(v));
+  }
   return map;
 }
 async function saveTokens(){
@@ -162,13 +176,11 @@ async function saveTokens(){
 }
 
 // ===== Locks / Dedupe =====
-const RUNNERS    = new Map();        // coinType -> stop() for DEX runner
-const SUBMITTING = new Map();        // coinType -> bool (shared)
-const SELL_LOCK  = new Map();        // coinType -> untilTs
-const SEEN_BUY   = new Map();        // coinType -> Set<digest> (LRU)
-// Auto-TP runner
-const TP_RUNNERS = new Map();        // coinType -> stop()
-// GLOBAL master
+const RUNNERS    = new Map();
+const SUBMITTING = new Map();
+const SELL_LOCK  = new Map();
+const SEEN_BUY   = new Map();
+const TP_RUNNERS = new Map();
 let GLOBAL_RUN = false;
 
 function lockActive(ct){ const until=SELL_LOCK.get(ct)||0; return Date.now()<until; }
@@ -243,7 +255,7 @@ function parseMoveCallTargets(tx){
   return arr;
 }
 
-// ===== BUY validator & Self-sell guard =====
+// ===== BUY validator & guards =====
 function hasExcludedPackage(targets){
   for (const tgt of targets){
     const pkg = String(tgt).split('::')[0].toLowerCase();
@@ -253,7 +265,7 @@ function hasExcludedPackage(targets){
 }
 function anyDexMoveCall(targets){
   if (!targets || !targets.length) return false;
-  if (hasExcludedPackage(targets)) return false; // blacklist
+  if (hasExcludedPackage(targets)) return false;
 
   if (DEX_PACKAGES.length>0){
     for (const tgt of targets){
@@ -277,6 +289,8 @@ function anyDexMoveCall(targets){
   }
   return targets.some(t => DEX_NAME_REGEX.test(String(t)));
 }
+
+// OLD pattern (SUI-only)
 function buyerSuiOutTokenIn(balanceChanges, buyerAddr, coinType){
   if (!Array.isArray(balanceChanges)) return false;
   let gotToken=0n, spentSui=0n;
@@ -289,7 +303,37 @@ function buyerSuiOutTokenIn(balanceChanges, buyerAddr, coinType){
   return (gotToken > 0n) && (spentSui < 0n);
 }
 
-// === NEW: detect if this tx is *our* sell (owner sending out coinType)
+// NEW: deteksi generik (pembayaran apapun)
+function analyzeBuyers(balanceChanges, coinType){
+  const by = new Map(); // addr -> {tokenIn:bigint, paid:bigint}
+  if (!Array.isArray(balanceChanges)) return [];
+
+  for (const bc of balanceChanges){
+    const addr = lower(bc?.owner?.AddressOwner || '');
+    if (!addr) continue;
+
+    const ct = String(bc?.coinType || '').toLowerCase();
+    let amt = 0n; try{ amt = BigInt(bc?.amount || 0); }catch{}
+
+    if (!by.has(addr)) by.set(addr, { tokenIn:0n, paid:0n });
+    const o = by.get(addr);
+
+    if (ct === String(coinType).toLowerCase() && amt > 0n) o.tokenIn += amt; // menerima token target
+
+    if (amt < 0n && ct !== String(coinType).toLowerCase()){ // membayar token lain
+      if (DETECT_ANY_PAY || PAY_SET.has(ct)) o.paid += (-amt);
+    }
+  }
+
+  const res = [];
+  for (const [addr, o] of by){
+    if (addr === lower(OWNER)) continue;
+    if (o.tokenIn > 0n && o.paid > 0n) res.push({ addr, amountTokenIn: o.tokenIn });
+  }
+  return res;
+}
+
+// NEW: jual milik owner?
 function ownerSoldThisTx(balanceChanges, coinType) {
   if (!Array.isArray(balanceChanges)) return false;
   for (const bc of balanceChanges) {
@@ -301,37 +345,35 @@ function ownerSoldThisTx(balanceChanges, coinType) {
   return false;
 }
 
-async function confirmDexBuy(digest, coinType, buyerAddr){
-  if (!digest) return false;
+async function confirmDexBuy(digest, coinType, buyerAddrHint){
+  if (!digest) return { ok:false };
   try{
     const tx = await client.getTransactionBlock({
       digest,
       options:{ showBalanceChanges:true, showEvents:false, showInput:true, showEffects:true }
     });
 
-    // Self-sell guard: kalau TX ini jual milik OWNER → bukan BUY
-    if (ownerSoldThisTx(tx?.balanceChanges || [], coinType)) {
-      if (DEBUG_DEX_MATCH) console.log(`[DEBUG] digest=${digest} SKIP (owner sold)`);
-      return false;
-    }
-
-    // Buyer pola: buyer dapat token + mengeluarkan SUI
-    const swapPattern = buyerSuiOutTokenIn(tx?.balanceChanges||[], buyerAddr, coinType);
-    if (!swapPattern) return false;
+    if (ownerSoldThisTx(tx?.balanceChanges || [], coinType)) return { ok:false };
 
     const targets = parseMoveCallTargets(tx);
-    if (hasExcludedPackage(targets)){
-      if (DEBUG_DEX_MATCH) console.log(`[DEBUG] digest=${digest} SKIP (EXCLUDED PKG)`);
-      return false;
-    }
-    const dexOK = anyDexMoveCall(targets);
-    if (DEBUG_DEX_MATCH) console.log(`[DEBUG] digest=${digest} buyer=${buyerAddr} dexOK=${dexOK} targets=${targets.length}`);
+    if (hasExcludedPackage(targets)) return { ok:false };
+    if (!anyDexMoveCall(targets))   return { ok:false };
 
-    // Buyer harus bukan OWNER
-    return dexOK && (lower(buyerAddr) !== lower(OWNER));
+    // 1) deteksi generik (FlowX/USDC/USDT/…)
+    const cands = analyzeBuyers(tx?.balanceChanges || [], coinType);
+    if (cands.length){
+      const pick = buyerAddrHint ? (cands.find(x => x.addr === lower(buyerAddrHint)) || cands[0]) : cands[0];
+      return { ok:true, buyer: pick.addr, amount: pick.amountTokenIn };
+    }
+
+    // 2) fallback lama: SUI-only
+    if (buyerAddrHint && buyerSuiOutTokenIn(tx?.balanceChanges||[], buyerAddrHint, coinType)){
+      return { ok:true, buyer: buyerAddrHint, amount: 0n };
+    }
+    return { ok:false };
   }catch(e){
     await logLine(`[DETECT WARN] getTx ${coinType}: ${e?.message||e}`);
-    return false;
+    return { ok:false };
   }
 }
 
@@ -354,7 +396,6 @@ function extractEst(any){
   return best;
 }
 
-// ---- RUTE FILTER: DEX-only, block blast.fun ----
 function routeLooksDexOnly(routeObj){
   try{
     const s = JSON.stringify(routeObj).toLowerCase();
@@ -390,19 +431,26 @@ async function buildSwapBytes(coinType, amountIn, slippageBps){
   if(!route || !route.routes?.length) throw new Error('No route');
 
   const filtered = (route.routes||[]).filter(rt => routeLooksDexOnly(rt));
-  if (!filtered.length) throw new Error('No dex-only route (filtered)');
-  if (DEBUG_DEX_MATCH){
-    console.log(`[DEBUG] Route filtered: ${filtered.length}/${route.routes.length} kept (DEX-only)`);
+  let chosen;
+  if (filtered.length){
+    chosen = { ...route, routes: filtered };
+  } else {
+    if (!ALLOW_ROUTE_FALLBACK) throw new Error('No dex-only route (filtered)');
+    // fallback: rute terbaik tanpa blacklist
+    const safe = (route.routes||[]).filter(rt => {
+      const s = JSON.stringify(rt).toLowerCase();
+      return !EXCLUDE_PACKAGES.some(x => x && s.includes(x));
+    });
+    chosen = safe.length ? { ...route, routes:safe } : route;
   }
-  route = { ...route, routes: filtered };
 
   const usedBps = Math.min(9900, Math.max(1, Number(slippageBps||200) + SAFE_BPS));
   const tx = await r.getTransactionForCompleteTradeRoute({
-    walletAddress: OWNER, completeRoute: route, slippage: usedBps/10_000
+    walletAddress: OWNER, completeRoute: chosen, slippage: usedBps/10_000
   });
   try{ if(typeof tx.setGasOwner==='function') tx.setGasOwner(OWNER); }catch{}
   const bytes = await tx.build({ client });
-  const estOut = extractEst(route);
+  const estOut = extractEst(chosen);
   return { bytes, estOut, usedBps };
 }
 async function submitFast(bytes){
@@ -488,7 +536,7 @@ async function sellPercentOnce(coinType, percent){
   }
 }
 
-// ===== Detector (DEX-only BUY + dedupe) — per token =====
+// ===== Detector (per token) =====
 function transferEventType(ct){ return `0x2::coin::TransferEvent<${ct}>`; }
 const rateLogState={ last:0, count:0 };
 async function warn429(tag, ct, msg){
@@ -508,10 +556,11 @@ function pickDigestFromEvent(ev){
 }
 async function triggerSellExact(coinType, digestHint, buyerAmountRaw){
   if (!buyerAmountRaw || buyerAmountRaw<=0n) return;
-  if (digestHint && alreadySeen(coinType, digestHint)) return;  // 1x/tx
+  if (digestHint && alreadySeen(coinType, digestHint)) return;
   if (digestHint) rememberDigest(coinType, digestHint);
   await sellExactOnce(coinType, buyerAmountRaw);
 }
+
 async function detectLoop(coinType){
   let cursor=null, nextCp=null;
   let seenEv=new Set(), seenTx=new Set();
@@ -519,9 +568,12 @@ async function detectLoop(coinType){
   while(RUNNERS.has(coinType)){
     let triggered=false;
 
-    // 1) Events: Transfer<coinType> (fast path)
+    // 1) via TransferEvent (cepat)
     try{
-      const resp=await client.queryEvents({ query:{ MoveEventType: transferEventType(coinType) }, cursor: cursor??null, limit:40, order:'descending' });
+      const resp=await client.queryEvents({
+        query:{ MoveEventType: transferEventType(coinType) },
+        cursor: cursor??null, limit:40, order:'descending'
+      });
       const evs=resp?.data||[]; if(evs.length) cursor=evs[0].id;
       for(const ev of evs){
         if(!RUNNERS.has(coinType)) break;
@@ -534,26 +586,26 @@ async function detectLoop(coinType){
         const amt  = toBig(pj.amount ?? pj.value ?? 0);
         const dig  = pickDigestFromEvent(ev);
 
-        // NEW: bila dari OWNER → ini kemungkinan TX sell kita sendiri → abaikan
-        if (from === lower(OWNER)) continue;
+        if (from === lower(OWNER)) continue; // self-sell guard
 
         if(amt>0n && to && to!==lower(OWNER)){
-          const okBuy = await confirmDexBuy(dig, coinType, to);
-          if (okBuy){
+          const c = await confirmDexBuy(dig, coinType, to);
+          if (c.ok){
+            const sellAmt = c.amount && c.amount>0n ? c.amount : amt;
             const cfg=normalizeCfg(TOKENS.get(coinType)||{}); const n=Date.now();
             if(!lockActive(coinType) && (n-(cfg.lastSellMs||0)>=cfg.cooldownMs)){
               TOKENS.set(coinType,{...cfg,lastSellMs:n,running:true}); await saveTokens();
-              await triggerSellExact(coinType, dig, amt);
+              await triggerSellExact(coinType, dig, sellAmt);
               triggered=true; break;
             }
           } else if (DEBUG_DEX_MATCH) {
-            console.log(`[DEBUG] Skip digest=${dig} — bukan DEX / EXCLUDED / self-sell.`);
+            console.log(`[DEBUG] Skip digest=${dig} — bukan DEX/EXCLUDED/self-sell.`);
           }
         }
       }
     }catch(e){ await warn429('events',coinType,String(e?.message||e)); }
 
-    // 2) Checkpoint walker (backup)
+    // 2) Checkpoint walker (cadangan)
     if(!triggered){
       try{
         const latestStr = await client.getLatestCheckpointSequenceNumber();
@@ -565,35 +617,29 @@ async function detectLoop(coinType){
           const cp=await client.getCheckpoint({ id:String(nextCp) }); nextCp++; steps++;
           const digs=cp?.transactions||[]; if(!digs.length) continue;
 
-          const txs=await client.multiGetTransactionBlocks({ digests:digs, options:{ showBalanceChanges:true, showInput:true, showEvents:false, showEffects:true } });
+          const txs=await client.multiGetTransactionBlocks({
+            digests:digs,
+            options:{ showBalanceChanges:true, showInput:true, showEvents:false, showEffects:true }
+          });
           for(const tx of (txs||[])){
             if(!tx?.digest || seenTx.has(tx.digest)) continue; seenTx.add(tx.digest); if(seenTx.size>2000) seenTx=new Set([...seenTx].slice(-700));
 
             const targets = parseMoveCallTargets(tx);
-            if (hasExcludedPackage(targets)) { if (DEBUG_DEX_MATCH) console.log(`[DEBUG] Walker skip ${tx.digest} — EXCLUDED PKG`); continue; }
-
-            // NEW: skip jika ini TX sell milik OWNER
+            if (hasExcludedPackage(targets)) continue;
             if (ownerSoldThisTx(tx?.balanceChanges || [], coinType)) continue;
 
-            for(const bc of (tx.balanceChanges||[])){
-              if(bc?.coinType!==coinType) continue;
-              const recv=lower(bc?.owner?.AddressOwner||''); const amt=toBig(bc.amount||'0');
-              if(amt>0n && recv && recv!==lower(OWNER)){
-                let okBuy = buyerSuiOutTokenIn(tx?.balanceChanges||[], recv, coinType);
-                if (okBuy) okBuy = anyDexMoveCall(targets);
-                if (okBuy){
-                  const cfg=normalizeCfg(TOKENS.get(coinType)||{}); const n=Date.now();
-                  if(!lockActive(coinType) && (n-(cfg.lastSellMs||0)>=cfg.cooldownMs)){
-                    TOKENS.set(coinType,{...cfg,lastSellMs:n,running:true}); await saveTokens();
-                    await triggerSellExact(coinType, tx.digest, amt);
-                    triggered=true; break;
-                  }
-                } else if (DEBUG_DEX_MATCH) {
-                  console.log(`[DEBUG] Walker skip digest=${tx.digest} — bukan DEX / EXCLUDED / self-sell.`);
-                }
-              }
-            }
-            if(triggered) break;
+            const cands = analyzeBuyers(tx?.balanceChanges || [], coinType);
+            if (!cands.length) continue;
+
+            if (alreadySeen(coinType, tx.digest)) continue;
+            rememberDigest(coinType, tx.digest);
+
+            const cfg=normalizeCfg(TOKENS.get(coinType)||{}); const n=Date.now();
+            if(lockActive(coinType) || (n-(cfg.lastSellMs||0)<cfg.cooldownMs)) continue;
+
+            TOKENS.set(coinType,{...cfg,lastSellMs:n,running:true}); await saveTokens();
+            await sellExactOnce(coinType, cands[0].amountTokenIn);
+            triggered=true; break;
           }
           if(triggered) break;
         }
@@ -604,7 +650,7 @@ async function detectLoop(coinType){
   }
 }
 
-// ===== GLOBAL Walker (pantau semua token running=true) =====
+// ===== GLOBAL Walker =====
 async function detectLoopGlobal(){
   let nextCp=null;
   let seenTx=new Set();
@@ -619,15 +665,13 @@ async function detectLoopGlobal(){
       let steps=0;
       while (GLOBAL_RUN && steps<5 && nextCp<=latest){
         const cp=await client.getCheckpoint({ id:String(nextCp) }); nextCp++; steps++;
-        const digs=cp?.transactions||[];
-        if(!digs.length) continue;
+        const digs=cp?.transactions||[]; if(!digs.length) continue;
 
         const txs=await client.multiGetTransactionBlocks({
           digests:digs,
           options:{ showBalanceChanges:true, showInput:true, showEvents:false, showEffects:true }
         });
 
-        // Siapkan daftar token aktif
         const ACTIVE = new Set();
         for (const [ct, cfg] of TOKENS){ if (cfg && cfg.running) ACTIVE.add(ct); }
         if (!ACTIVE.size) continue;
@@ -643,24 +687,16 @@ async function detectLoopGlobal(){
           const bcs = tx.balanceChanges||[];
           if(!bcs.length) continue;
 
-          // NEW: skip global apabila tx adalah self-sell untuk coin aktif mana pun
+          // skip jika tx adalah self-sell untuk coin aktif mana pun
           let selfSellHit = false;
           for (const ct of ACTIVE){
             if (ownerSoldThisTx(bcs, ct)) { selfSellHit = true; break; }
           }
           if (selfSellHit) continue;
 
-          for(const bc of bcs){
-            const ct = bc?.coinType;
-            if (!ct || !ACTIVE.has(ct)) continue;
-
-            const recv=lower(bc?.owner?.AddressOwner||'');
-            const amt=toBig(bc?.amount||'0');
-            if (amt<=0n || !recv || recv===lower(OWNER)) continue;
-
-            let okBuy = buyerSuiOutTokenIn(bcs, recv, ct);
-            if (okBuy) okBuy = anyDexMoveCall(targets);
-            if (!okBuy) continue;
+          for (const ct of ACTIVE){
+            const list = analyzeBuyers(bcs, ct);
+            if (!list.length) continue;
 
             if (alreadySeen(ct, tx.digest)) continue;
             rememberDigest(ct, tx.digest);
@@ -670,7 +706,7 @@ async function detectLoopGlobal(){
             if (lockActive(ct) || (n-(cfg.lastSellMs||0)<cfg.cooldownMs)) continue;
 
             TOKENS.set(ct,{...cfg,lastSellMs:n}); await saveTokens();
-            await sellExactOnce(ct, amt);
+            await sellExactOnce(ct, list[0].amountTokenIn);
           }
         }
       }
@@ -682,14 +718,12 @@ async function detectLoopGlobal(){
 }
 async function startGlobalAutoSell(){
   if (GLOBAL_RUN) return;
-  // 1) Set semua token running=true
   let changes=0;
   for (const [ct, cfg0] of TOKENS){
     const cfg = normalizeCfg(cfg0||{});
     if (!cfg.running){ TOKENS.set(ct,{...cfg, running:true}); changes++; }
   }
   if (changes>0){ await saveTokens(); console.log(`⚡ GLOBAL: set running=true untuk ${changes} token`); }
-  // 2) Start loop global
   GLOBAL_RUN = true;
   detectLoopGlobal().catch(async e=>{ await logLine(`[GLOBAL ERROR] ${e?.message||e}`); });
   console.log(`⚡ GLOBAL Auto-sell ON (multi token; 1 loop pantau semua token)`);
@@ -705,12 +739,12 @@ async function stopGlobalAutoSell(){
   console.log(`⏸️ GLOBAL Auto-sell OFF`);
 }
 
-// ===== Auto-TP runner =====
+// ===== Auto-TP =====
 async function ensureProbe(coinType){
   const cfg = normalizeCfg(TOKENS.get(coinType)||{});
   if (cfg.tpProbeRaw && cfg.tpProbeRaw>0n) return cfg.tpProbeRaw;
   const dec = await getDecimals(coinType);
-  const probe = pow10(BigInt(dec)); // 1 token dalam raw units
+  const probe = pow10(BigInt(dec));
   TOKENS.set(coinType, { ...cfg, tpProbeRaw: probe }); await saveTokens();
   return probe;
 }
@@ -723,7 +757,7 @@ async function getQuoteSui(coinType, amountInRaw){
   if(!route || !route.routes?.length) return 0n;
   const filtered = (route.routes||[]).filter(rt => routeLooksDexOnly(rt));
   const used = filtered.length ? { ...route, routes: filtered } : route;
-  return extractEst(used); // raw SUI (9 desimal)
+  return extractEst(used);
 }
 async function tpLoop(coinType){
   while (TP_RUNNERS.has(coinType)){
@@ -732,8 +766,8 @@ async function tpLoop(coinType){
       if (!cfg.tpRunning || cfg.tpPriceSui<=0) { await sleep(TP_POLL_MS); continue; }
 
       const probe = await ensureProbe(coinType);
-      const quoteOut = await getQuoteSui(coinType, probe); // raw SUI
-      const targetOut = BigInt(Math.floor(cfg.tpPriceSui * 1e9)); // SUI per 1 token → raw 9 desimal
+      const quoteOut = await getQuoteSui(coinType, probe);
+      const targetOut = BigInt(Math.floor(cfg.tpPriceSui * 1e9));
 
       if (quoteOut >= targetOut){
         const n=Date.now();
@@ -785,25 +819,43 @@ async function stopAutoSell(coinType){
 
 // ===== Menu =====
 async function promptAddOrEdit(existing){
-  const base=normalizeCfg(existing||{});
-  const ans=await inquirer.prompt([
-    { name:'coinType', message:'Coin type (0x..::mod::SYMBOL)', when:!existing, validate:v=>isCoinType(v)||'Format salah' },
-    { name:'sellPercent', message:'Sell % (untuk Test SELL manual)', default: base.sellPercent, filter:Number },
-    { name:'minSellRaw',  message:'Min sell (raw units)',           default: base.minSellRaw.toString(), filter:v=>BigInt(v) },
-    { name:'cooldownMs',  message:'Cooldown antar SELL (ms)',       default: base.cooldownMs, filter:Number },
-    { name:'slippageBps', message:'Slippage (bps)',                 default: base.slippageBps, filter:Number },
+  const base = normalizeCfg(existing || {});
+  const isNew = !existing; // tambah token baru?
+
+  const ans = await inquirer.prompt([
+    { 
+      name:'coinType', 
+      message:'Coin type (0x..::mod::SYMBOL)', 
+      when: !existing, 
+      validate: v => isCoinType(v) || 'Format salah' 
+    },
+    { 
+      name:'sellPercent', 
+      message:'Sell % (untuk Test SELL manual)', 
+      // default 1 kalau NEW; kalau EDIT pakai nilai tersimpan
+      default: isNew ? 1 : base.sellPercent, 
+      filter: Number 
+    },
+    { 
+      name:'minSellRaw',  
+      message:'Min sell (raw units)',           
+      default: base.minSellRaw.toString(), 
+      filter: v => BigInt(v) 
+    },
+    { 
+      name:'cooldownMs',  
+      message:'Cooldown antar SELL (ms)',       
+      default: base.cooldownMs, 
+      filter: Number 
+    },
+    { 
+      name:'slippageBps', 
+      message:'Slippage (bps)',                 
+      default: base.slippageBps, 
+      filter: Number 
+    },
   ]);
-  return ans;
-}
-async function promptSetTP(existing){
-  const base=normalizeCfg(existing||{});
-  const dec = await getDecimals(existing?.coinType || (await (async()=>{throw new Error('Pilih token dahulu');})()));
-  const ans=await inquirer.prompt([
-    { name:'tpPriceSui',    message:`Target harga (SUI per 1 token, desimal token=${dec})`, default: base.tpPriceSui||0, filter:Number },
-    { name:'tpSellPercent', message:'Sell % saat TP', default: base.tpSellPercent||100, filter:Number },
-  ]);
-  ans.tpPriceSui = Math.max(0, Number(ans.tpPriceSui||0));
-  ans.tpSellPercent = Math.min(100, Math.max(1, Number(ans.tpSellPercent||100)));
+
   return ans;
 }
 function renderTable(){
@@ -827,11 +879,9 @@ async function viewActivityLog(){
 async function autoStartSaved(){
   const fixed=new Map(); for(const [k,v] of await loadTokens()) fixed.set(k, normalizeCfg(v)); TOKENS=fixed; await saveTokens();
 
-  // GLOBAL master switch di startup
   if (MULTI_WALKER){
     await startGlobalAutoSell();
   } else {
-    // Perilaku lama: start per token jika running=true
     for(const [k,v] of TOKENS){ if(v.running) startAutoSell(k); if(v.tpRunning) startAutoTP(k); }
   }
 }
@@ -840,7 +890,9 @@ async function menu(){
   await autoStartSaved();
   while(true){
     const suiBal=fmtMist(await getBalanceRaw(OWNER,SUI));
-    console.log(`\nRPC: ${HTTP_URL}`); console.log(`Owner: ${OWNER}`); console.log(`SUI Balance: ${suiBal}`);
+    console.log(`\nRPC: ${HTTP_URL}`);
+    console.log(`Owner: ${OWNER}`);
+    console.log(`SUI Balance: ${suiBal}`);
     const {action}=await inquirer.prompt({
       type:'list', name:'action', message:'Pilih menu', pageSize:16, choices:[
         {name:'➕ Tambah token', value:'add'},
@@ -858,15 +910,24 @@ async function menu(){
 
     if(action==='add'){
       const a=await promptAddOrEdit();
-      if(TOKENS.has(a.coinType)) console.log('Token sudah ada. Pakai menu Ubah.');
-      else { TOKENS.set(a.coinType,{...normalizeCfg(a), running:false, tpRunning:false, lastSellMs:0 }); await saveTokens(); console.log(`[ADD] ${a.coinType}`); }
+      if(TOKENS.has(a.coinType)) {
+        console.log('Token sudah ada. Pakai menu Ubah.');
+      } else {
+        TOKENS.set(a.coinType,{...normalizeCfg(a), running:true, tpRunning:false, lastSellMs:0 });
+        await saveTokens();
+        await startAutoSell(a.coinType); // mulai pantau token ini segera
+        console.log(`[ADD] ${a.coinType} (running=true, auto-sell aktif)`);
+      }
     }
 
     if(action==='edit'){
       if(!TOKENS.size){ console.log('Belum ada token.'); continue; }
       const {key}=await inquirer.prompt({ type:'list', name:'key', message:'Pilih token', choices:[...TOKENS.keys()] });
-      const cur={...normalizeCfg(TOKENS.get(key)||{}), coinType:key}; const upd=await promptAddOrEdit(cur);
-      TOKENS.set(key,{...normalizeCfg(cur), ...normalizeCfg(upd)}); await saveTokens(); console.log(`[EDIT] ${key}`);
+      const cur={...normalizeCfg(TOKENS.get(key)||{}), coinType:key};
+      const upd=await promptAddOrEdit(cur);
+      TOKENS.set(key,{...normalizeCfg(cur), ...normalizeCfg(upd)});
+      await saveTokens();
+      console.log(`[EDIT] ${key}`);
     }
 
     if(action==='oneshot'){
@@ -884,16 +945,18 @@ async function menu(){
       if(!TOKENS.size){ console.log('Belum ada token.'); continue; }
       const {key}=await inquirer.prompt({ type:'list', name:'key', message:'Pilih token (DEX runner)', choices:[...TOKENS.keys()] });
       const cfg=normalizeCfg(TOKENS.get(key)||{});
-      if(!cfg.running){ TOKENS.set(key,{...cfg, running:true}); await saveTokens(); await startAutoSell(key); }
-      else { await stopAutoSell(key); }
+      if(!cfg.running){
+        TOKENS.set(key,{...cfg, running:true});
+        await saveTokens();
+        await startAutoSell(key);
+      } else {
+        await stopAutoSell(key);
+      }
     }
 
     if(action==='toggle_global'){
-      if (!GLOBAL_RUN){
-        await startGlobalAutoSell();
-      } else {
-        await stopGlobalAutoSell();
-      }
+      if (!GLOBAL_RUN){ await startGlobalAutoSell(); }
+      else { await stopGlobalAutoSell(); }
     }
 
     if(action==='set_tp'){
@@ -901,8 +964,8 @@ async function menu(){
       const {key}=await inquirer.prompt({ type:'list', name:'key', message:'Pilih token (set TP)', choices:[...TOKENS.keys()] });
       const cur={...normalizeCfg(TOKENS.get(key)||{}), coinType:key};
       const upd=await promptSetTP(cur);
-      const newer={...cur, ...upd};
-      TOKENS.set(key, normalizeCfg(newer)); await saveTokens();
+      TOKENS.set(key, normalizeCfg({ ...cur, ...upd }));
+      await saveTokens();
       console.log(`[TP SET] ${key} target=${upd.tpPriceSui} SUI per 1 token, sell%=${upd.tpSellPercent}%`);
     }
 
@@ -910,8 +973,13 @@ async function menu(){
       if(!TOKENS.size){ console.log('Belum ada token.'); continue; }
       const {key}=await inquirer.prompt({ type:'list', name:'key', message:'Pilih token (Auto-TP)', choices:[...TOKENS.keys()] });
       const cfg=normalizeCfg(TOKENS.get(key)||{});
-      if(!cfg.tpRunning){ TOKENS.set(key,{...cfg, tpRunning:true}); await saveTokens(); await startAutoTP(key); }
-      else { await stopAutoTP(key); }
+      if(!cfg.tpRunning){
+        TOKENS.set(key,{...cfg, tpRunning:true});
+        await saveTokens();
+        await startAutoTP(key);
+      } else {
+        await stopAutoTP(key);
+      }
     }
 
     if(action==='list') renderTable();
@@ -921,6 +989,10 @@ async function menu(){
 }
 
 // ===== Start =====
-process.on('unhandledRejection', async(e)=>{ await logLine(`[WARN] UnhandledRejection: ${e?.message||e}`); });
-process.on('uncaughtException', async(e)=>{ await logLine(`[WARN] UncaughtException: ${e?.message||e}`); });
-menu().catch(async e=>{ console.error('Fatal:', e?.message||e); await logLine(`[FATAL] ${e?.message||String(e)}`); process.exit(1); });
+process.on('unhandledRejection', async (e) => { await logLine(`[WARN] UnhandledRejection: ${e?.message||e}`); });
+process.on('uncaughtException', async (e) => { await logLine(`[WARN] UncaughtException: ${e?.message||e}`); });
+menu().catch(async (e) => {
+  console.error('Fatal:', e?.message||e);
+  await logLine(`[FATAL] ${e?.message||String(e)}`);
+  process.exit(1);
+});
