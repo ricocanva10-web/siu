@@ -1,0 +1,25 @@
+# === KUNCI & RPC ===
+PRIVATE_KEY=0x
+HTTP_URL=https://fullnode.mainnet.sui.io:443
+
+# === PERFORMA & SAFETY ===
+FAST_POLL_MS=80
+SAFE_BPS=300
+SELL_LOCK_MS=1500
+QUIET_429=true
+
+# === DETEKSI DEX ===
+STRICT_DEX_NAMES=false
+DEX_NAME_LIST=cetus,clmm,pool,integrate,flowx,aggregator,swap_exact_input,swap_exact_output,swap_tokens,aftermath,amm,stableswap,turbos,router,bluemove,dex,deepbook,db_router,smart_router,route,swap,kriya,bluefin,route_all
+DEX_PACKAGES=
+
+# === EXCLUDE (BLACKLIST) — blast.fun ===
+EXCLUDE_PACKAGES=0x779829966a2e8642c310bed79e6ba603e5acd3c31b25d7d4511e2c9303d6e3ef
+
+# === DEBUG & AUTO-TP ===
+DEBUG_DEX_MATCH=false
+TP_POLL_MS=1200
+
+# === GLOBAL WALKER ===
+# Aktifkan global di startup (opsional, bisa ON/OFF dari menu juga)
+MULTI_WALKER=true
