@@ -6,11 +6,12 @@
  * MODE 2: Auto-TP (jual saat harga >= target Aftermath quote)
  * MODE 3: GLOBAL walker (pantau semua token running=true)
  *
- * Perbaikan:
- * - Guard pengirim: TX yang dikirim OWNER tidak pernah dianggap BUY (hindari auto-jual usai BUY sendiri).
+ * Perbaikan utama:
+ * - Guard pengirim: TX yang dikirim OWNER tidak pernah dianggap BUY.
  * - Deteksi buyer generik (SUI/USDC/USDT/…) agar FlowX/aggregator kebaca.
- * - Whitelist paket DEX (default FlowX) + blacklist blast.fun (dan kawan2 fair-launch).
- * - Route filter "DEX-only"; fallback non-strict bisa dimatikan dengan ALLOW_ROUTE_FALLBACK=false (default aman).
+ * - Whitelist paket DEX (default FlowX) + blacklist blast.fun (2 paket) & fair-launch.
+ * - Route filter "DEX-only" (paket blacklist disaring). Fallback bisa dimatikan via ALLOW_ROUTE_FALLBACK=false.
+ * - Cek paket blacklist bukan hanya di MoveCall target, tapi juga di objectChanges (interacted with).
  */
 
 import 'dotenv/config';
@@ -65,9 +66,13 @@ const DEX_NAME_LIST = (process.env.DEX_NAME_LIST||'')
 const DEX_NAME_SET = new Set(DEX_NAME_LIST.length? DEX_NAME_LIST : DEFAULT_DEX_NAME_LIST);
 
 // === Blacklist (EXCLUDE) & whitelist (INCLUDE) paket ===
-const EXCLUDE_PACKAGES = (process.env.EXCLUDE_PACKAGES||
-  '0x779829966a2e8642c310bed79e6ba603e5acd3c31b25d7d4511e2c9303d6e3ef' // blast.fun
-).split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+// Default blacklist termasuk 2 paket blast.fun yang kamu kirim
+const DEFAULT_EXCLUDE_PACKAGES = [
+  '0x779829966a2e8642c310bed79e6ba603e5acd3c31b25d7d4511e2c9303d6e3ef', // blast.fun
+  '0x1dc6658e2d0df5303dbc44053495424a428f5789426ffe0f040710bfb8d26213', // blast.fun (interacted with)
+].join(',');
+const EXCLUDE_PACKAGES = (process.env.EXCLUDE_PACKAGES || DEFAULT_EXCLUDE_PACKAGES)
+  .split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
 
 // FlowX package default (kalau .env kosong, otomatis pakai ini)
 const FLOWX_PKG_DEFAULT = '0xba153169476e8c3114962261d1edc70de5ad9781b83cc617ecc8c1923191cae0';
@@ -255,6 +260,34 @@ function parseMoveCallTargets(tx){
   return arr;
 }
 
+// ===== Scan paket dari ObjectChanges (untuk "interacted with") =====
+function pkgFromType(typeStr){
+  if (!typeStr || typeof typeStr !== 'string') return null;
+  const m = typeStr.match(/^(0x[0-9a-fA-F]+)::/);
+  return m ? m[1].toLowerCase() : null;
+}
+function collectPackagesFromObjectChanges(tx){
+  const out = new Set();
+  const oc = tx?.objectChanges || [];
+  for (const ch of oc){
+    const t = (ch && (ch.objectType || ch.object_type)) ? (ch.objectType || ch.object_type) : null;
+    const pid = ch?.packageId || ch?.package_id || null;
+    const p1 = pkgFromType(t);
+    if (p1) out.add(p1);
+    if (pid && /^0x[0-9a-fA-F]+$/.test(pid)) out.add(String(pid).toLowerCase());
+  }
+  return [...out];
+}
+function hasExcludedByObjectChanges(tx){
+  try{
+    const pkgs = collectPackagesFromObjectChanges(tx);
+    for (const p of pkgs){
+      if (EXCLUDE_PACKAGES.includes(String(p).toLowerCase())) return true;
+    }
+    return false;
+  }catch{ return false; }
+}
+
 // ===== BUY validator & guards =====
 function hasExcludedPackage(targets){
   for (const tgt of targets){
@@ -350,7 +383,13 @@ async function confirmDexBuy(digest, coinType, buyerAddrHint){
   try{
     const tx = await client.getTransactionBlock({
       digest,
-      options:{ showBalanceChanges:true, showEvents:false, showInput:true, showEffects:true }
+      options:{
+        showBalanceChanges:true,
+        showEvents:false,
+        showInput:true,
+        showEffects:true,
+        showObjectChanges:true, // penting untuk "interacted with"
+      }
     });
 
     // GUARD: TX dikirim OWNER → bukan BUY
@@ -360,7 +399,11 @@ async function confirmDexBuy(digest, coinType, buyerAddrHint){
     if (ownerSoldThisTx(tx?.balanceChanges || [], coinType)) return { ok:false };
 
     const targets = parseMoveCallTargets(tx);
-    if (hasExcludedPackage(targets)) return { ok:false };
+
+    // TOLAK jika ada paket blacklist di targets ATAU di objectChanges
+    if (hasExcludedPackage(targets) || hasExcludedByObjectChanges(tx)) return { ok:false };
+
+    // Pastikan ada panggilan DEX (sesuai whitelist/nama)
     if (!anyDexMoveCall(targets))   return { ok:false };
 
     // 1) deteksi generik
@@ -623,11 +666,14 @@ async function detectLoop(coinType){
 
           const txs=await client.multiGetTransactionBlocks({
             digests:digs,
-            options:{ showBalanceChanges:true, showInput:true, showEvents:false, showEffects:true }
+            options:{
+              showBalanceChanges:true, showInput:true, showEvents:false, showEffects:true,
+              showObjectChanges:true
+            }
           });
           for(const tx of (txs||[])){
-            if(!tx?.digest || seenTx.has(tx.digest)) continue; 
-            seenTx.add(tx.digest); 
+            if(!tx?.digest || seenTx.has(tx.digest)) continue;
+            seenTx.add(tx.digest);
             if(seenTx.size>2000) seenTx=new Set([...seenTx].slice(-700));
 
             // GUARD: TX sender OWNER → skip
@@ -635,7 +681,7 @@ async function detectLoop(coinType){
             if (txSender === lower(OWNER)) continue;
 
             const targets = parseMoveCallTargets(tx);
-            if (hasExcludedPackage(targets)) continue;
+            if (hasExcludedPackage(targets) || hasExcludedByObjectChanges(tx)) continue;
             if (ownerSoldThisTx(tx?.balanceChanges || [], coinType)) continue;
 
             const cands = analyzeBuyers(tx?.balanceChanges || [], coinType);
@@ -679,7 +725,10 @@ async function detectLoopGlobal(){
 
         const txs=await client.multiGetTransactionBlocks({
           digests:digs,
-          options:{ showBalanceChanges:true, showInput:true, showEvents:false, showEffects:true }
+          options:{
+            showBalanceChanges:true, showInput:true, showEvents:false, showEffects:true,
+            showObjectChanges:true
+          }
         });
 
         const ACTIVE = new Set();
@@ -696,7 +745,7 @@ async function detectLoopGlobal(){
           if (txSender === lower(OWNER)) continue;
 
           const targets = parseMoveCallTargets(tx);
-          if (hasExcludedPackage(targets)) continue;
+          if (hasExcludedPackage(targets) || hasExcludedByObjectChanges(tx)) continue;
 
           const bcs = tx.balanceChanges||[];
           if(!bcs.length) continue;
@@ -829,7 +878,7 @@ async function stopAutoSell(coinType){
     try { r.stop(); } catch {}
   }
   RUNNERS.delete(coinType);
-  const cfg = normalizeCfg(TOKENS.get(coinType) || {}); // <- kurung tutupnya benar di sini
+  const cfg = normalizeCfg(TOKENS.get(coinType) || {});
   TOKENS.set(coinType, { ...cfg, running: false });
   await saveTokens();
   console.log(`⏸️ Auto-sell OFF ${coinType}`);
@@ -841,48 +890,48 @@ async function promptAddOrEdit(existing){
   const isNew = !existing;
 
   const ans = await inquirer.prompt([
-    { 
-      name:'coinType', 
-      message:'Coin type (0x..::mod::SYMBOL)', 
-      when: !existing, 
-      validate: v => isCoinType(v) || 'Format salah' 
+    {
+      name:'coinType',
+      message:'Coin type (0x..::mod::SYMBOL)',
+      when: !existing,
+      validate: v => isCoinType(v) || 'Format salah'
     },
-    { 
-      name:'sellPercent', 
-      message:'Sell % (untuk Test SELL manual)', 
-      default: isNew ? 1 : base.sellPercent, 
-      filter: Number 
+    {
+      name:'sellPercent',
+      message:'Sell % (untuk Test SELL manual)',
+      default: isNew ? 1 : base.sellPercent,
+      filter: Number
     },
-    { 
-      name:'minSellRaw',  
-      message:'Min sell (raw units)',           
-      default: base.minSellRaw.toString(), 
-      filter: v => BigInt(v) 
+    {
+      name:'minSellRaw',
+      message:'Min sell (raw units)',
+      default: base.minSellRaw.toString(),
+      filter: v => BigInt(v)
     },
-    { 
-      name:'cooldownMs',  
-      message:'Cooldown antar SELL (ms)',       
-      default: base.cooldownMs, 
-      filter: Number 
+    {
+      name:'cooldownMs',
+      message:'Cooldown antar SELL (ms)',
+      default: base.cooldownMs,
+      filter: Number
     },
-    { 
-      name:'slippageBps', 
-      message:'Slippage (bps)',                 
-      default: base.slippageBps, 
-      filter: Number 
+    {
+      name:'slippageBps',
+      message:'Slippage (bps)',
+      default: base.slippageBps,
+      filter: Number
     },
   ]);
 
   return ans;
 }
 
-// Tambahan: promptSetTP agar script mandiri (menghindari ReferenceError)
+// Tambahan: promptSetTP agar script mandiri
 async function promptSetTP(existing){
   const base = normalizeCfg(existing || {});
   const ans = await inquirer.prompt([
     {
       name:'tpPriceSui',
-      message:'Target harga (SUI per 1 token, gunakan desimal SUI, contoh 0.0000012)',
+      message:'Target harga (SUI per 1 token, contoh 0.0000012)',
       default: base.tpPriceSui || 0,
       filter: Number
     },
