@@ -12,8 +12,14 @@
   },
   "dependencies": {
     "@mysten/sui": "^1.34.0",
-    "aftermath-ts-sdk": "^1.3.17",
-    "dotenv": "^16.4.5",
-    "inquirer": "^9.2.16"
-  }
+    "@mysten/sui.js": "^0.54.1",
+    "aftermath-ts-sdk": "^1.3.18",
+    "dotenv": "^16.6.1",
+    "inquirer": "^9.3.7"
+  },
+  "main": "bot.js",
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": ""
 }
