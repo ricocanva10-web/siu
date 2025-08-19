@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 /**
- * SUI AUTO-SELL — FINAL
+ * SUI AUTO-SELL — FINAL (DEX-only trigger & DEX-only route)
  * --------------------------------------------------------------------------------------------
  * MODE 1: Auto-sell saat ada BUY via DEX (jual exact amount pembeli)
  * MODE 2: Auto-TP (jual saat harga >= target Aftermath quote)
  * MODE 3: GLOBAL walker (pantau semua token running=true)
  *
- * Perbaikan penting:
- * - Deteksi buyer GENERIK (pembayaran bisa SUI/USDC/USDT/dll) → FlowX kebaca.
- * - Whitelist paket DEX (default: FlowX) + blacklist blast.fun.
- * - Route filter "DEX-only" + opsi fallback agar tidak gagal "No dex-only route".
- * - Self-sell guard: TX jual milik OWNER tidak dianggap BUY.
+ * Perbaikan:
+ * - Guard pengirim: TX yang dikirim OWNER tidak pernah dianggap BUY (hindari auto-jual usai BUY sendiri).
+ * - Deteksi buyer generik (SUI/USDC/USDT/…) agar FlowX/aggregator kebaca.
+ * - Whitelist paket DEX (default FlowX) + blacklist blast.fun (dan kawan2 fair-launch).
+ * - Route filter "DEX-only"; fallback non-strict bisa dimatikan dengan ALLOW_ROUTE_FALLBACK=false (default aman).
  */
 
 import 'dotenv/config';
@@ -327,7 +327,7 @@ function analyzeBuyers(balanceChanges, coinType){
 
   const res = [];
   for (const [addr, o] of by){
-    if (addr === lower(OWNER)) continue;
+    if (addr === lower(OWNER)) continue;       // jangan anggap diri sendiri
     if (o.tokenIn > 0n && o.paid > 0n) res.push({ addr, amountTokenIn: o.tokenIn });
   }
   return res;
@@ -353,20 +353,24 @@ async function confirmDexBuy(digest, coinType, buyerAddrHint){
       options:{ showBalanceChanges:true, showEvents:false, showInput:true, showEffects:true }
     });
 
+    // GUARD: TX dikirim OWNER → bukan BUY
+    const sender = lower(tx?.effects?.sender || tx?.transaction?.data?.sender || '');
+    if (sender === lower(OWNER)) return { ok:false };
+
     if (ownerSoldThisTx(tx?.balanceChanges || [], coinType)) return { ok:false };
 
     const targets = parseMoveCallTargets(tx);
     if (hasExcludedPackage(targets)) return { ok:false };
     if (!anyDexMoveCall(targets))   return { ok:false };
 
-    // 1) deteksi generik (FlowX/USDC/USDT/…)
+    // 1) deteksi generik
     const cands = analyzeBuyers(tx?.balanceChanges || [], coinType);
     if (cands.length){
       const pick = buyerAddrHint ? (cands.find(x => x.addr === lower(buyerAddrHint)) || cands[0]) : cands[0];
       return { ok:true, buyer: pick.addr, amount: pick.amountTokenIn };
     }
 
-    // 2) fallback lama: SUI-only
+    // 2) fallback SUI-only
     if (buyerAddrHint && buyerSuiOutTokenIn(tx?.balanceChanges||[], buyerAddrHint, coinType)){
       return { ok:true, buyer: buyerAddrHint, amount: 0n };
     }
@@ -622,7 +626,13 @@ async function detectLoop(coinType){
             options:{ showBalanceChanges:true, showInput:true, showEvents:false, showEffects:true }
           });
           for(const tx of (txs||[])){
-            if(!tx?.digest || seenTx.has(tx.digest)) continue; seenTx.add(tx.digest); if(seenTx.size>2000) seenTx=new Set([...seenTx].slice(-700));
+            if(!tx?.digest || seenTx.has(tx.digest)) continue; 
+            seenTx.add(tx.digest); 
+            if(seenTx.size>2000) seenTx=new Set([...seenTx].slice(-700));
+
+            // GUARD: TX sender OWNER → skip
+            const txSender = lower(tx?.effects?.sender || tx?.transaction?.data?.sender || '');
+            if (txSender === lower(OWNER)) continue;
 
             const targets = parseMoveCallTargets(tx);
             if (hasExcludedPackage(targets)) continue;
@@ -680,6 +690,10 @@ async function detectLoopGlobal(){
           if(!GLOBAL_RUN) break;
           if(!tx?.digest || seenTx.has(tx.digest)) continue;
           seenTx.add(tx.digest); if(seenTx.size>4000) seenTx=new Set([...seenTx].slice(-1500));
+
+          // GUARD: TX sender OWNER → skip
+          const txSender = lower(tx?.effects?.sender || tx?.transaction?.data?.sender || '');
+          if (txSender === lower(OWNER)) continue;
 
           const targets = parseMoveCallTargets(tx);
           if (hasExcludedPackage(targets)) continue;
@@ -810,17 +824,21 @@ async function startAutoSell(coinType){
   console.log(`▶️ Auto-sell ON ${coinType} (DEX-only, poll ~${FAST_POLL_MS}ms)`);
 }
 async function stopAutoSell(coinType){
-  const r=RUNNERS.get(coinType); if(r){ try{ r.stop(); }catch{} }
+  const r = RUNNERS.get(coinType);
+  if (r) {
+    try { r.stop(); } catch {}
+  }
   RUNNERS.delete(coinType);
-  const cfg=normalizeCfg(TOKENS.get(coinType)||{});
-  TOKENS.set(coinType,{...cfg,running:false}); await saveTokens();
+  const cfg = normalizeCfg(TOKENS.get(coinType) || {}); // <- kurung tutupnya benar di sini
+  TOKENS.set(coinType, { ...cfg, running: false });
+  await saveTokens();
   console.log(`⏸️ Auto-sell OFF ${coinType}`);
 }
 
 // ===== Menu =====
 async function promptAddOrEdit(existing){
   const base = normalizeCfg(existing || {});
-  const isNew = !existing; // tambah token baru?
+  const isNew = !existing;
 
   const ans = await inquirer.prompt([
     { 
@@ -832,7 +850,6 @@ async function promptAddOrEdit(existing){
     { 
       name:'sellPercent', 
       message:'Sell % (untuk Test SELL manual)', 
-      // default 1 kalau NEW; kalau EDIT pakai nilai tersimpan
       default: isNew ? 1 : base.sellPercent, 
       filter: Number 
     },
@@ -858,6 +875,27 @@ async function promptAddOrEdit(existing){
 
   return ans;
 }
+
+// Tambahan: promptSetTP agar script mandiri (menghindari ReferenceError)
+async function promptSetTP(existing){
+  const base = normalizeCfg(existing || {});
+  const ans = await inquirer.prompt([
+    {
+      name:'tpPriceSui',
+      message:'Target harga (SUI per 1 token, gunakan desimal SUI, contoh 0.0000012)',
+      default: base.tpPriceSui || 0,
+      filter: Number
+    },
+    {
+      name:'tpSellPercent',
+      message:'Sell % saat TP terpenuhi',
+      default: base.tpSellPercent || 100,
+      filter: Number
+    }
+  ]);
+  return ans;
+}
+
 function renderTable(){
   const rows=[];
   for(const [k,vr] of TOKENS){
@@ -915,7 +953,7 @@ async function menu(){
       } else {
         TOKENS.set(a.coinType,{...normalizeCfg(a), running:true, tpRunning:false, lastSellMs:0 });
         await saveTokens();
-        await startAutoSell(a.coinType); // mulai pantau token ini segera
+        await startAutoSell(a.coinType);
         console.log(`[ADD] ${a.coinType} (running=true, auto-sell aktif)`);
       }
     }
