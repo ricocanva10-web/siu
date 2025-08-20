@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 /**
- * SUI AUTO-SELL — FINAL (DEX-only trigger & DEX-only route)
+ * SUI AUTO-SELL — FINAL (DEX-agnostic trigger & DEX-only route)
  * --------------------------------------------------------------------------------------------
  * MODE 1: Auto-sell saat ada BUY via DEX (jual exact amount pembeli)
  * MODE 2: Auto-TP (jual saat harga >= target Aftermath quote)
  * MODE 3: GLOBAL walker (pantau semua token running=true)
  *
- * Perbaikan utama:
+ * Inti:
  * - Guard pengirim: TX yang dikirim OWNER tidak pernah dianggap BUY.
- * - Deteksi buyer generik (SUI/USDC/USDT/…) agar FlowX/aggregator kebaca.
- * - Whitelist paket DEX (default FlowX) + blacklist blast.fun (2 paket) & fair-launch.
+ * - Deteksi buyer generik (SUI/USDC/USDT/apa pun) agar aggregator/DEX lain ikut kebaca.
+ * - Whitelist paket DEX (opsional), plus blacklist 6 paket (2 blast.fun + 4 CA tambahan).
  * - Route filter "DEX-only" (paket blacklist disaring). Fallback bisa dimatikan via ALLOW_ROUTE_FALLBACK=false.
- * - Cek paket blacklist bukan hanya di MoveCall target, tapi juga di objectChanges (interacted with).
+ * - Anti-LP yang aman: HANYA dari nama fungsi MoveCall (bukan objectChanges) agar swap tidak ikut diblok.
  */
 
 import 'dotenv/config';
@@ -42,7 +42,7 @@ const DEBUG_DEX_MATCH  = String(process.env.DEBUG_DEX_MATCH||'false').toLowerCas
 const TP_POLL_MS   = Math.max(400, Number(process.env.TP_POLL_MS || '1200'));
 const MULTI_WALKER = String(process.env.MULTI_WALKER||'false').toLowerCase()==='true';
 
-// deteksi pembayaran BUY (agar FlowX kebaca)
+// deteksi pembayaran BUY (agar aggregator/DEX apa pun kebaca)
 const DETECT_ANY_PAY = String(process.env.DETECT_ANY_PAY || 'false').toLowerCase() === 'true';
 const PAY_COINS = (process.env.DETECT_PAY_COINS || SUI)
   .split(',').map(s => s.trim()).filter(Boolean);
@@ -66,15 +66,20 @@ const DEX_NAME_LIST = (process.env.DEX_NAME_LIST||'')
 const DEX_NAME_SET = new Set(DEX_NAME_LIST.length? DEX_NAME_LIST : DEFAULT_DEX_NAME_LIST);
 
 // === Blacklist (EXCLUDE) & whitelist (INCLUDE) paket ===
-// Default blacklist termasuk 2 paket blast.fun yang kamu kirim
+// Default blacklist: 2 blast.fun + 4 CA tambahan (sesuai permintaan)
 const DEFAULT_EXCLUDE_PACKAGES = [
   '0x779829966a2e8642c310bed79e6ba603e5acd3c31b25d7d4511e2c9303d6e3ef', // blast.fun
   '0x1dc6658e2d0df5303dbc44053495424a428f5789426ffe0f040710bfb8d26213', // blast.fun (interacted with)
+  // 4 CA tambahan:
+  '0x8406834e5a27c1600979da46d8c7cd830523d5937c3f443ea70af396ae27461e',
+  '0x083d903646de7e14659e1eb0086477183ec7e997730b8e19722ae92ddb96dd54',
+  '0xd2b0db05849cb7fd1f3de2ddd52a219b0805f7771dc7b01634ac3740fe436881',
+  '0xa204bd0d48d49fc7b8b05c8ef3f3ae63d1b22d157526a88b91391b41e6053157',
 ].join(',');
 const EXCLUDE_PACKAGES = (process.env.EXCLUDE_PACKAGES || DEFAULT_EXCLUDE_PACKAGES)
   .split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
 
-// FlowX package default (kalau .env kosong, otomatis pakai ini)
+// FlowX package default (kalau .env kosong, otomatis pakai ini) — TETAP, tapi logika trigger dibuat DEX-agnostic
 const FLOWX_PKG_DEFAULT = '0xba153169476e8c3114962261d1edc70de5ad9781b83cc617ecc8c1923191cae0';
 const DEX_PACKAGES = (process.env.DEX_PACKAGES || FLOWX_PKG_DEFAULT)
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
@@ -84,6 +89,65 @@ const DEX_NAME_REGEX = /\b(swap|router|cetus|flowx|turbos|bluemove|aftermath|kri
 
 // === Fair-launch / aggregator yang harus dihindari pada rute ===
 const FAIRLAUNCH_PROTOCOLS = ['HopFun','MovePump','DoubleUpPump','TurbosFun','BlastFun'];
+
+// === Anti-LP: hanya lewat NAMA FUNGSI (jangan pakai objectChanges) ===
+// === Larangan: transaksi LIQUIDITY (jangan pernah dianggap BUY) ===
+// Pakai normalisasi agar varian "RemoveLiquidityAndCollectFee", "remove_liquidity",
+// "SwapAndUnstake", dsb tetap terdeteksi.
+function _norm(s){ return String(s||'').toLowerCase().replace(/[^a-z]/g,''); }
+
+const LIQUIDITY_FUNC_KEYS_NORM = new Set([
+  // remove / decrease / withdraw / collect
+  'removeliquidity','removeliquidityandcollectfee','removeliquidityandcollectfees',
+  'decreaseliquidity','withdrawliquidity','withdraw','collect','collectfee','collectfees',
+
+  // add / increase / mint / burn / position ops / pool ops
+  'addliquidity','increaseliquidity','mintposition','burnposition','burnlp',
+  'createpool','openposition','closeposition','position','clmmposition',
+
+  // NOTE:
+  // DULU kita mem‐blacklist 'unstake' dan 'swapandunstake', tapi itu membuat
+  // pembelian nyata via Aftermath (Swap + Unstake) ikut keblokir.
+  // Solusi: jangan blacklist 'unstake' di sini; dan walaupun ada kata 'unstake',
+  // jika ada 'swap' pada target maka TIDAK dianggap LP.
+  // -> jadi baris 'unstake','swapandunstake' DIHAPUS dari daftar.
+]);
+
+const LIQUIDITY_TYPE_HINTS = [
+  '::lp::','::lp_token::','::pool::','::position::','::clmm_position::','::liquidity::'
+];
+
+function hasLiquidityFunction(targets){
+  if(!Array.isArray(targets)) return false;
+  for(const t of targets){
+    const n = _norm(t);
+    for(const k of LIQUIDITY_FUNC_KEYS_NORM){ if(n.includes(k)) return true; }
+  }
+  return false;
+}
+function hasLiquidityObjectChanges(tx){
+  try{
+    const oc = tx?.objectChanges || [];
+    for(const ch of oc){
+      const type = String(ch?.objectType || ch?.object_type || '').toLowerCase();
+      for(const hint of LIQUIDITY_TYPE_HINTS){ if(type.includes(hint)) return true; }
+    }
+    return false;
+  }catch{ return false; }
+}
+function isLiquidityTx(targets, tx){
+  // Jika ada indikasi LP (fungsi atau objectChanges) ...
+  const flagged = hasLiquidityFunction(targets) || hasLiquidityObjectChanges(tx);
+  if (!flagged) return false;
+
+  // ... tapi transaksi juga mengandung 'swap' (swap_exact_input, swapandunstake, dll),
+  // anggap BUKAN LP murni -> biarkan lolos untuk diuji sebagai BUY.
+  const hasSwap = Array.isArray(targets) && targets.some(t => _norm(t).includes('swap'));
+  if (hasSwap) return false;
+
+  // Selain itu, tetap dianggap LP dan di-skip.
+  return true;
+}
 
 // ===== IO =====
 const __filename = fileURLToPath(import.meta.url);
@@ -136,7 +200,7 @@ async function getDecimals(coinType){
   DECIMALS.set(coinType, d);
   return d;
 }
-function pow10(n){ let r=1n; for(let i=0;i<n;i++) r*=10n; return r; }
+function pow10(n){ n=Number(n); let r=1n; for(let i=0;i<n;i++) r*=10n; return r; }
 
 // ===== tokens.json =====
 function normalizeCfg(raw={}){
@@ -260,7 +324,7 @@ function parseMoveCallTargets(tx){
   return arr;
 }
 
-// ===== Scan paket dari ObjectChanges (untuk "interacted with") =====
+// ===== Scan paket dari ObjectChanges (untuk "interacted with" → hanya untuk blacklist CA) =====
 function pkgFromType(typeStr){
   if (!typeStr || typeof typeStr !== 'string') return null;
   const m = typeStr.match(/^(0x[0-9a-fA-F]+)::/);
@@ -323,7 +387,7 @@ function anyDexMoveCall(targets){
   return targets.some(t => DEX_NAME_REGEX.test(String(t)));
 }
 
-// OLD pattern (SUI-only)
+// SUI-only fallback
 function buyerSuiOutTokenIn(balanceChanges, buyerAddr, coinType){
   if (!Array.isArray(balanceChanges)) return false;
   let gotToken=0n, spentSui=0n;
@@ -336,7 +400,7 @@ function buyerSuiOutTokenIn(balanceChanges, buyerAddr, coinType){
   return (gotToken > 0n) && (spentSui < 0n);
 }
 
-// NEW: deteksi generik (pembayaran apapun)
+// Deteksi generik (pembayaran apa pun)
 function analyzeBuyers(balanceChanges, coinType){
   const by = new Map(); // addr -> {tokenIn:bigint, paid:bigint}
   if (!Array.isArray(balanceChanges)) return [];
@@ -366,7 +430,7 @@ function analyzeBuyers(balanceChanges, coinType){
   return res;
 }
 
-// NEW: jual milik owner?
+// Owner self-sell?
 function ownerSoldThisTx(balanceChanges, coinType) {
   if (!Array.isArray(balanceChanges)) return false;
   for (const bc of balanceChanges) {
@@ -388,7 +452,7 @@ async function confirmDexBuy(digest, coinType, buyerAddrHint){
         showEvents:false,
         showInput:true,
         showEffects:true,
-        showObjectChanges:true, // penting untuk "interacted with"
+        showObjectChanges:true, // masih digunakan untuk blacklist CA, bukan untuk LP
       }
     });
 
@@ -400,23 +464,27 @@ async function confirmDexBuy(digest, coinType, buyerAddrHint){
 
     const targets = parseMoveCallTargets(tx);
 
+    // ❗ Anti-LP: HANYA dari nama fungsi (supaya swap tidak ketutup)
+    if (isLiquidityTx(targets)) return { ok:false };
+
     // TOLAK jika ada paket blacklist di targets ATAU di objectChanges
     if (hasExcludedPackage(targets) || hasExcludedByObjectChanges(tx)) return { ok:false };
 
-    // Pastikan ada panggilan DEX (sesuai whitelist/nama)
-    if (!anyDexMoveCall(targets))   return { ok:false };
-
-    // 1) deteksi generik
+    // 1) Deteksi pembeli nyata dulu (DEX-agnostic)
     const cands = analyzeBuyers(tx?.balanceChanges || [], coinType);
     if (cands.length){
       const pick = buyerAddrHint ? (cands.find(x => x.addr === lower(buyerAddrHint)) || cands[0]) : cands[0];
       return { ok:true, buyer: pick.addr, amount: pick.amountTokenIn };
     }
 
-    // 2) fallback SUI-only
+    // 2) Jika belum ketemu pembeli, baru pastikan ada panggilan DEX via heuristik
+    if (!anyDexMoveCall(targets)) return { ok:false };
+
+    // 3) SUI-only fallback kalau ada buyerAddrHint
     if (buyerAddrHint && buyerSuiOutTokenIn(tx?.balanceChanges||[], buyerAddrHint, coinType)){
       return { ok:true, buyer: buyerAddrHint, amount: 0n };
     }
+
     return { ok:false };
   }catch(e){
     await logLine(`[DETECT WARN] getTx ${coinType}: ${e?.message||e}`);
@@ -646,7 +714,7 @@ async function detectLoop(coinType){
               triggered=true; break;
             }
           } else if (DEBUG_DEX_MATCH) {
-            console.log(`[DEBUG] Skip digest=${dig} — bukan DEX/EXCLUDED/self-sell.`);
+            console.log(`[DEBUG] Skip digest=${dig} — bukan BUY (EXCLUDED/self-sell/LP/heuristik DEX).`);
           }
         }
       }
@@ -681,6 +749,7 @@ async function detectLoop(coinType){
             if (txSender === lower(OWNER)) continue;
 
             const targets = parseMoveCallTargets(tx);
+            if (isLiquidityTx(targets)) continue;        // anti-LP via nama fungsi
             if (hasExcludedPackage(targets) || hasExcludedByObjectChanges(tx)) continue;
             if (ownerSoldThisTx(tx?.balanceChanges || [], coinType)) continue;
 
@@ -745,6 +814,7 @@ async function detectLoopGlobal(){
           if (txSender === lower(OWNER)) continue;
 
           const targets = parseMoveCallTargets(tx);
+          if (isLiquidityTx(targets)) continue;          // anti-LP via nama fungsi
           if (hasExcludedPackage(targets) || hasExcludedByObjectChanges(tx)) continue;
 
           const bcs = tx.balanceChanges||[];
@@ -807,7 +877,7 @@ async function ensureProbe(coinType){
   const cfg = normalizeCfg(TOKENS.get(coinType)||{});
   if (cfg.tpProbeRaw && cfg.tpProbeRaw>0n) return cfg.tpProbeRaw;
   const dec = await getDecimals(coinType);
-  const probe = pow10(BigInt(dec));
+  const probe = pow10(dec);
   TOKENS.set(coinType, { ...cfg, tpProbeRaw: probe }); await saveTokens();
   return probe;
 }
@@ -870,13 +940,11 @@ async function startAutoSell(coinType){
   const cfg=normalizeCfg(TOKENS.get(coinType)||{});
   TOKENS.set(coinType,{...cfg,running:true}); await saveTokens();
   detectLoop(coinType).catch(async e=>{ await logLine(`[DETECT ERROR] ${coinType}: ${e?.message||e}`); });
-  console.log(`▶️ Auto-sell ON ${coinType} (DEX-only, poll ~${FAST_POLL_MS}ms)`);
+  console.log(`▶️ Auto-sell ON ${coinType} (DEX-agnostic, poll ~${FAST_POLL_MS}ms)`);
 }
 async function stopAutoSell(coinType){
   const r = RUNNERS.get(coinType);
-  if (r) {
-    try { r.stop(); } catch {}
-  }
+  if (r) { try { r.stop(); } catch {} }
   RUNNERS.delete(coinType);
   const cfg = normalizeCfg(TOKENS.get(coinType) || {});
   TOKENS.set(coinType, { ...cfg, running: false });
@@ -925,7 +993,6 @@ async function promptAddOrEdit(existing){
   return ans;
 }
 
-// Tambahan: promptSetTP agar script mandiri
 async function promptSetTP(existing){
   const base = normalizeCfg(existing || {});
   const ans = await inquirer.prompt([
