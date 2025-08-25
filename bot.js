@@ -12,6 +12,7 @@
  * - Whitelist paket DEX (opsional), plus blacklist 6 paket (2 blast.fun + 4 CA tambahan).
  * - Route filter "DEX-only" (paket blacklist disaring). Fallback bisa dimatikan via ALLOW_ROUTE_FALLBACK=false.
  * - Anti-LP yang aman: HANYA dari nama fungsi MoveCall (bukan objectChanges) agar swap tidak ikut diblok.
+ * - AMBANG MIN-BUY (SUI): global + per-token (default 0.1 SUI), trigger JUAL hanya jika paidSuiRaw ≥ ambang.
  */
 
 import 'dotenv/config';
@@ -91,26 +92,13 @@ const DEX_NAME_REGEX = /\b(swap|router|cetus|flowx|turbos|bluemove|aftermath|kri
 const FAIRLAUNCH_PROTOCOLS = ['HopFun','MovePump','DoubleUpPump','TurbosFun','BlastFun'];
 
 // === Anti-LP: hanya lewat NAMA FUNGSI (jangan pakai objectChanges) ===
-// === Larangan: transaksi LIQUIDITY (jangan pernah dianggap BUY) ===
-// Pakai normalisasi agar varian "RemoveLiquidityAndCollectFee", "remove_liquidity",
-// "SwapAndUnstake", dsb tetap terdeteksi.
 function _norm(s){ return String(s||'').toLowerCase().replace(/[^a-z]/g,''); }
 
 const LIQUIDITY_FUNC_KEYS_NORM = new Set([
-  // remove / decrease / withdraw / collect
   'removeliquidity','removeliquidityandcollectfee','removeliquidityandcollectfees',
   'decreaseliquidity','withdrawliquidity','withdraw','collect','collectfee','collectfees',
-
-  // add / increase / mint / burn / position ops / pool ops
   'addliquidity','increaseliquidity','mintposition','burnposition','burnlp',
   'createpool','openposition','closeposition','position','clmmposition',
-
-  // NOTE:
-  // DULU kita mem‐blacklist 'unstake' dan 'swapandunstake', tapi itu membuat
-  // pembelian nyata via Aftermath (Swap + Unstake) ikut keblokir.
-  // Solusi: jangan blacklist 'unstake' di sini; dan walaupun ada kata 'unstake',
-  // jika ada 'swap' pada target maka TIDAK dianggap LP.
-  // -> jadi baris 'unstake','swapandunstake' DIHAPUS dari daftar.
 ]);
 
 const LIQUIDITY_TYPE_HINTS = [
@@ -136,16 +124,10 @@ function hasLiquidityObjectChanges(tx){
   }catch{ return false; }
 }
 function isLiquidityTx(targets, tx){
-  // Jika ada indikasi LP (fungsi atau objectChanges) ...
   const flagged = hasLiquidityFunction(targets) || hasLiquidityObjectChanges(tx);
   if (!flagged) return false;
-
-  // ... tapi transaksi juga mengandung 'swap' (swap_exact_input, swapandunstake, dll),
-  // anggap BUKAN LP murni -> biarkan lolos untuk diuji sebagai BUY.
   const hasSwap = Array.isArray(targets) && targets.some(t => _norm(t).includes('swap'));
   if (hasSwap) return false;
-
-  // Selain itu, tetap dianggap LP dan di-skip.
   return true;
 }
 
@@ -202,6 +184,23 @@ async function getDecimals(coinType){
 }
 function pow10(n){ n=Number(n); let r=1n; for(let i=0;i<n;i++) r*=10n; return r; }
 
+// ===== Global Min-BUY threshold (SUI) & helpers =====
+const DEFAULT_MIN_BUY_MIST = 100_000_000n; // 0.1 SUI
+function toMistRawFromSuiFloat(x){
+  const n = Number(x||0);
+  if (!Number.isFinite(n) || n<=0) return 0n;
+  return BigInt(Math.round(n * 1e9));
+}
+function fromMistToSuiFloat(raw){
+  try { return Number(BigInt(raw))/1e9; } catch { return 0; }
+}
+let GLOBAL = { useGlobalMin: true, minBuyMistRaw: DEFAULT_MIN_BUY_MIST };
+let TOKENS = new Map();
+function getActiveMinBuyMistRaw(cfg){
+  const per = (cfg && cfg.minBuyMistRaw!=null) ? BigInt(cfg.minBuyMistRaw) : DEFAULT_MIN_BUY_MIST;
+  return GLOBAL && GLOBAL.useGlobalMin ? (GLOBAL.minBuyMistRaw||DEFAULT_MIN_BUY_MIST) : per;
+}
+
 // ===== tokens.json =====
 function normalizeCfg(raw={}){
   return {
@@ -217,28 +216,52 @@ function normalizeCfg(raw={}){
     tpSellPercent:  Math.min(100, Math.max(1, toNum(raw.tpSellPercent, 100))),
     tpProbeRaw:     raw.tpProbeRaw ? toBig(raw.tpProbeRaw) : 0n,
     tpLastHitMs:    toNum(raw.tpLastHitMs, 0),
+
+    // minimal BUY in mist (SUI)
+    minBuyMistRaw: (raw.minBuyMistRaw!=null? toBig(raw.minBuyMistRaw) : DEFAULT_MIN_BUY_MIST),
   };
 }
-let TOKENS = new Map();
 async function loadTokens(){
   const data=await readJsonSafe(TOK_PATH,{});
+  // Load GLOBAL if present
+  if (data && typeof data==='object' && data.global){
+    try {
+      GLOBAL = {
+        useGlobalMin: !!data.global.useGlobalMin,
+        minBuyMistRaw: data.global.minBuyMistRaw!=null ? BigInt(data.global.minBuyMistRaw) : DEFAULT_MIN_BUY_MIST
+      };
+    } catch {}
+  }
+  // tokens could be under data.tokens (new) or root (legacy)
+  const src = (data && typeof data==='object' && data.tokens && typeof data.tokens==='object') ? data.tokens : data;
   const map=new Map();
-  if (Array.isArray(data)) {
-    for(const it of data) if(it?.coinType&&isCoinType(it.coinType)) map.set(it.coinType, normalizeCfg(it));
-  } else if (data && typeof data==='object') {
-    for(const [k,v] of Object.entries(data)) if(isCoinType(k)) map.set(k, normalizeCfg(v));
+  if (Array.isArray(src)) {
+    for(const it of src) if(it?.coinType&&isCoinType(it.coinType)) map.set(it.coinType, normalizeCfg(it));
+  } else if (src && typeof src==='object') {
+    for(const [k,v] of Object.entries(src)) if(isCoinType(k)) map.set(k, normalizeCfg(v));
   }
   return map;
 }
 async function saveTokens(){
-  const obj={};
-  for(const [k,vr] of TOKENS){
-    const v=normalizeCfg(vr);
-    obj[k]={
-      sellPercent:v.sellPercent, minSellRaw:v.minSellRaw.toString(), cooldownMs:v.cooldownMs,
-      slippageBps:v.slippageBps, running:v.running, lastSellMs:v.lastSellMs,
-      tpRunning:v.tpRunning, tpPriceSui:v.tpPriceSui, tpSellPercent:v.tpSellPercent,
-      tpProbeRaw:(v.tpProbeRaw||0n).toString(), tpLastHitMs:v.tpLastHitMs
+  const obj = { tokens: {}, global: {
+    useGlobalMin: !!GLOBAL.useGlobalMin,
+    minBuyMistRaw: (GLOBAL.minBuyMistRaw || 0n).toString()
+  }};
+  for (const [k, vr] of TOKENS){
+    const v = normalizeCfg(vr);
+    obj.tokens[k] = {
+      sellPercent: v.sellPercent,
+      minSellRaw: (v.minSellRaw || 0n).toString(),
+      cooldownMs: v.cooldownMs,
+      slippageBps: v.slippageBps,
+      running: !!v.running,
+      lastSellMs: v.lastSellMs || 0,
+      minBuyMistRaw: (v.minBuyMistRaw ?? DEFAULT_MIN_BUY_MIST).toString(),
+      tpRunning: !!v.tpRunning,
+      tpPriceSui: v.tpPriceSui || 0,
+      tpSellPercent: v.tpSellPercent || 100,
+      tpProbeRaw: (v.tpProbeRaw || 0n).toString(),
+      tpLastHitMs: v.tpLastHitMs || 0
     };
   }
   await writeJsonAtomic(TOK_PATH, obj);
@@ -352,6 +375,25 @@ function hasExcludedByObjectChanges(tx){
   }catch{ return false; }
 }
 
+// ===== (NEW) Interacted-with DEX packages (Cetus) =====
+const INTERACT_DEX_PACKAGES = [
+  '0x550dcd6070230d8bf18d99d34e3b2ca1d3657b76cc80ffdacdb2b5d28d7e0124',
+  '0x07c27e879ba9282506284b0fef26d393978906fc9496550d978c6f493dbfa3e5',
+].map(s => s.toLowerCase());
+
+function anyDexByObjectChanges(tx){
+  try{
+    if (!INTERACT_DEX_PACKAGES.length) return false;
+    const pkgs = collectPackagesFromObjectChanges(tx);
+    for (const p of pkgs){
+      if (INTERACT_DEX_PACKAGES.includes(String(p).toLowerCase())) return true;
+    }
+    return false;
+  }catch{
+    return false;
+  }
+}
+
 // ===== BUY validator & guards =====
 function hasExcludedPackage(targets){
   for (const tgt of targets){
@@ -387,7 +429,7 @@ function anyDexMoveCall(targets){
   return targets.some(t => DEX_NAME_REGEX.test(String(t)));
 }
 
-// SUI-only fallback
+// SUI-only helpers
 function buyerSuiOutTokenIn(balanceChanges, buyerAddr, coinType){
   if (!Array.isArray(balanceChanges)) return false;
   let gotToken=0n, spentSui=0n;
@@ -399,10 +441,20 @@ function buyerSuiOutTokenIn(balanceChanges, buyerAddr, coinType){
   }
   return (gotToken > 0n) && (spentSui < 0n);
 }
+function buyerPaidSuiRaw(balanceChanges, buyerAddr){
+  if (!Array.isArray(balanceChanges)) return 0n;
+  let spent=0n;
+  for(const bc of balanceChanges){
+    const own = lower(bc?.owner?.AddressOwner||'');
+    if (own !== lower(buyerAddr)) continue;
+    if (bc?.coinType === SUI){ try{ const x=BigInt(bc.amount||0); if (x<0n) spent += (-x); }catch{} }
+  }
+  return spent;
+}
 
 // Deteksi generik (pembayaran apa pun)
 function analyzeBuyers(balanceChanges, coinType){
-  const by = new Map(); // addr -> {tokenIn:bigint, paid:bigint}
+  const by = new Map(); // addr -> {tokenIn:bigint, paid:bigint, paidSuiRaw:bigint}
   if (!Array.isArray(balanceChanges)) return [];
 
   for (const bc of balanceChanges){
@@ -412,20 +464,21 @@ function analyzeBuyers(balanceChanges, coinType){
     const ct = String(bc?.coinType || '').toLowerCase();
     let amt = 0n; try{ amt = BigInt(bc?.amount || 0); }catch{}
 
-    if (!by.has(addr)) by.set(addr, { tokenIn:0n, paid:0n });
+    if (!by.has(addr)) by.set(addr, { tokenIn:0n, paid:0n, paidSuiRaw:0n });
     const o = by.get(addr);
 
     if (ct === String(coinType).toLowerCase() && amt > 0n) o.tokenIn += amt; // menerima token target
 
     if (amt < 0n && ct !== String(coinType).toLowerCase()){ // membayar token lain
       if (DETECT_ANY_PAY || PAY_SET.has(ct)) o.paid += (-amt);
+      if (ct === SUI.toLowerCase()) o.paidSuiRaw += (-amt);
     }
   }
 
   const res = [];
   for (const [addr, o] of by){
     if (addr === lower(OWNER)) continue;       // jangan anggap diri sendiri
-    if (o.tokenIn > 0n && o.paid > 0n) res.push({ addr, amountTokenIn: o.tokenIn });
+    if (o.tokenIn > 0n && o.paid > 0n) res.push({ addr, amountTokenIn: o.tokenIn, paidSuiRaw: o.paidSuiRaw||0n });
   }
   return res;
 }
@@ -452,7 +505,7 @@ async function confirmDexBuy(digest, coinType, buyerAddrHint){
         showEvents:false,
         showInput:true,
         showEffects:true,
-        showObjectChanges:true, // masih digunakan untuk blacklist CA, bukan untuk LP
+        showObjectChanges:true,
       }
     });
 
@@ -465,7 +518,7 @@ async function confirmDexBuy(digest, coinType, buyerAddrHint){
     const targets = parseMoveCallTargets(tx);
 
     // ❗ Anti-LP: HANYA dari nama fungsi (supaya swap tidak ketutup)
-    if (isLiquidityTx(targets)) return { ok:false };
+    if (isLiquidityTx(targets, tx)) return { ok:false };
 
     // TOLAK jika ada paket blacklist di targets ATAU di objectChanges
     if (hasExcludedPackage(targets) || hasExcludedByObjectChanges(tx)) return { ok:false };
@@ -474,15 +527,17 @@ async function confirmDexBuy(digest, coinType, buyerAddrHint){
     const cands = analyzeBuyers(tx?.balanceChanges || [], coinType);
     if (cands.length){
       const pick = buyerAddrHint ? (cands.find(x => x.addr === lower(buyerAddrHint)) || cands[0]) : cands[0];
-      return { ok:true, buyer: pick.addr, amount: pick.amountTokenIn };
+      return { ok:true, buyer: pick.addr, amount: pick.amountTokenIn, paidSuiRaw: pick.paidSuiRaw||0n };
     }
 
-    // 2) Jika belum ketemu pembeli, baru pastikan ada panggilan DEX via heuristik
-    if (!anyDexMoveCall(targets)) return { ok:false };
+    // 2) Jika belum ketemu pembeli, pastikan transaksi memang via DEX
+    const looksDex = anyDexMoveCall(targets) || anyDexByObjectChanges(tx);
+    if (!looksDex) return { ok:false };
 
-    // 3) SUI-only fallback kalau ada buyerAddrHint
+    // 3) SUI-only fallback kalau ada buyerAddrHint (tetap hitung paidSuiRaw)
     if (buyerAddrHint && buyerSuiOutTokenIn(tx?.balanceChanges||[], buyerAddrHint, coinType)){
-      return { ok:true, buyer: buyerAddrHint, amount: 0n };
+      const paid = buyerPaidSuiRaw(tx?.balanceChanges||[], buyerAddrHint);
+      return { ok:true, buyer: buyerAddrHint, amount: 0n, paidSuiRaw: paid };
     }
 
     return { ok:false };
@@ -708,8 +763,11 @@ async function detectLoop(coinType){
           if (c.ok){
             const sellAmt = c.amount && c.amount>0n ? c.amount : amt;
             const cfg=normalizeCfg(TOKENS.get(coinType)||{}); const n=Date.now();
+            const minBuy = getActiveMinBuyMistRaw(cfg);
+            const paidSui = (c.paidSuiRaw||0n);
+            if (paidSui < minBuy){ if (DEBUG_DEX_MATCH) console.log(`[DEBUG] Skip digest=${dig} — paidSui ${fmtMist(paidSui)} < min ${fmtMist(minBuy)} SUI`); continue; }
             if(!lockActive(coinType) && (n-(cfg.lastSellMs||0)>=cfg.cooldownMs)){
-              TOKENS.set(coinType,{...cfg,lastSellMs:n,running:true}); await saveTokens();
+              TOKENS.set(coinType,{...cfg,lastSellMs:n,running:true});
               await triggerSellExact(coinType, dig, sellAmt);
               triggered=true; break;
             }
@@ -749,20 +807,26 @@ async function detectLoop(coinType){
             if (txSender === lower(OWNER)) continue;
 
             const targets = parseMoveCallTargets(tx);
-            if (isLiquidityTx(targets)) continue;        // anti-LP via nama fungsi
+            if (isLiquidityTx(targets, tx)) continue;        // anti-LP via nama fungsi
             if (hasExcludedPackage(targets) || hasExcludedByObjectChanges(tx)) continue;
             if (ownerSoldThisTx(tx?.balanceChanges || [], coinType)) continue;
 
             const cands = analyzeBuyers(tx?.balanceChanges || [], coinType);
             if (!cands.length) continue;
 
+            // 🔒 Ambang SUI wajib lolos
+            const cfg=normalizeCfg(TOKENS.get(coinType)||{});
+            const paidSui = cands[0].paidSuiRaw || 0n;
+            const minBuy = getActiveMinBuyMistRaw(cfg);
+            if (paidSui < minBuy) continue;
+
             if (alreadySeen(coinType, tx.digest)) continue;
             rememberDigest(coinType, tx.digest);
 
-            const cfg=normalizeCfg(TOKENS.get(coinType)||{}); const n=Date.now();
+            const n=Date.now();
             if(lockActive(coinType) || (n-(cfg.lastSellMs||0)<cfg.cooldownMs)) continue;
 
-            TOKENS.set(coinType,{...cfg,lastSellMs:n,running:true}); await saveTokens();
+            TOKENS.set(coinType,{...cfg,lastSellMs:n,running:true}); 
             await sellExactOnce(coinType, cands[0].amountTokenIn);
             triggered=true; break;
           }
@@ -814,7 +878,7 @@ async function detectLoopGlobal(){
           if (txSender === lower(OWNER)) continue;
 
           const targets = parseMoveCallTargets(tx);
-          if (isLiquidityTx(targets)) continue;          // anti-LP via nama fungsi
+          if (isLiquidityTx(targets, tx)) continue;          // anti-LP via nama fungsi
           if (hasExcludedPackage(targets) || hasExcludedByObjectChanges(tx)) continue;
 
           const bcs = tx.balanceChanges||[];
@@ -831,14 +895,19 @@ async function detectLoopGlobal(){
             const list = analyzeBuyers(bcs, ct);
             if (!list.length) continue;
 
+            // 🔒 Ambang SUI wajib lolos (global/per-token)
+            const cfg=normalizeCfg(TOKENS.get(ct)||{});
+            const paidSui = list[0].paidSuiRaw || 0n;
+            const minBuy = getActiveMinBuyMistRaw(cfg);
+            if (paidSui < minBuy) continue;
+
             if (alreadySeen(ct, tx.digest)) continue;
             rememberDigest(ct, tx.digest);
 
-            const cfg=normalizeCfg(TOKENS.get(ct)||{});
             const n=Date.now();
             if (lockActive(ct) || (n-(cfg.lastSellMs||0)<cfg.cooldownMs)) continue;
 
-            TOKENS.set(ct,{...cfg,lastSellMs:n}); await saveTokens();
+            TOKENS.set(ct,{...cfg,lastSellMs:n}); 
             await sellExactOnce(ct, list[0].amountTokenIn);
           }
         }
@@ -878,7 +947,7 @@ async function ensureProbe(coinType){
   if (cfg.tpProbeRaw && cfg.tpProbeRaw>0n) return cfg.tpProbeRaw;
   const dec = await getDecimals(coinType);
   const probe = pow10(dec);
-  TOKENS.set(coinType, { ...cfg, tpProbeRaw: probe }); await saveTokens();
+  TOKENS.set(coinType, { ...cfg, tpProbeRaw: probe }); 
   return probe;
 }
 async function getQuoteSui(coinType, amountInRaw){
@@ -905,7 +974,7 @@ async function tpLoop(coinType){
       if (quoteOut >= targetOut){
         const n=Date.now();
         if(!lockActive(coinType) && (n-(cfg.lastSellMs||0)>=cfg.cooldownMs)){
-          TOKENS.set(coinType,{...cfg,lastSellMs:n}); await saveTokens();
+          TOKENS.set(coinType,{...cfg,lastSellMs:n}); 
           console.log(`🎯 Target tercapai for ${coinType}: quote≈${fmtMist(quoteOut)} SUI ≥ target ${cfg.tpPriceSui}`);
           await sellPercentOnce(coinType, cfg.tpSellPercent);
         }
@@ -921,7 +990,7 @@ async function startAutoTP(coinType){
   if (TP_RUNNERS.has(coinType)) return;
   TP_RUNNERS.set(coinType, { stop:()=> TP_RUNNERS.delete(coinType) });
   const cfg=normalizeCfg(TOKENS.get(coinType)||{});
-  TOKENS.set(coinType,{...cfg,tpRunning:true}); await saveTokens();
+  TOKENS.set(coinType,{...cfg,tpRunning:true}); 
   tpLoop(coinType).catch(async e=>{ await logLine(`[TP ERROR] ${coinType}: ${e?.message||e}`); });
   console.log(`🎯 Auto-TP ON ${coinType} (poll ~${TP_POLL_MS}ms)`);
 }
@@ -929,7 +998,7 @@ async function stopAutoTP(coinType){
   const r=TP_RUNNERS.get(coinType); if(r){ try{ r.stop(); }catch{} }
   TP_RUNNERS.delete(coinType);
   const cfg=normalizeCfg(TOKENS.get(coinType)||{});
-  TOKENS.set(coinType,{...cfg,tpRunning:false}); await saveTokens();
+  TOKENS.set(coinType,{...cfg,tpRunning:false}); 
   console.log(`🎯⏸️ Auto-TP OFF ${coinType}`);
 }
 
@@ -938,7 +1007,7 @@ async function startAutoSell(coinType){
   if(RUNNERS.has(coinType)) return;
   RUNNERS.set(coinType, { stop:()=> RUNNERS.delete(coinType) });
   const cfg=normalizeCfg(TOKENS.get(coinType)||{});
-  TOKENS.set(coinType,{...cfg,running:true}); await saveTokens();
+  TOKENS.set(coinType,{...cfg,running:true}); 
   detectLoop(coinType).catch(async e=>{ await logLine(`[DETECT ERROR] ${coinType}: ${e?.message||e}`); });
   console.log(`▶️ Auto-sell ON ${coinType} (DEX-agnostic, poll ~${FAST_POLL_MS}ms)`);
 }
@@ -948,7 +1017,6 @@ async function stopAutoSell(coinType){
   RUNNERS.delete(coinType);
   const cfg = normalizeCfg(TOKENS.get(coinType) || {});
   TOKENS.set(coinType, { ...cfg, running: false });
-  await saveTokens();
   console.log(`⏸️ Auto-sell OFF ${coinType}`);
 }
 
@@ -988,6 +1056,13 @@ async function promptAddOrEdit(existing){
       default: base.slippageBps,
       filter: Number
     },
+    // NEW: per-token Min BUY (SUI)
+    {
+      name:'minBuyMistRaw',
+      message:'Min BUY (SUI) untuk trigger auto-sell (per-token)',
+      default: isNew ? 0.1 : fromMistToSuiFloat(base.minBuyMistRaw || DEFAULT_MIN_BUY_MIST),
+      filter: v => toMistRawFromSuiFloat(v)
+    },
   ]);
 
   return ans;
@@ -1018,6 +1093,7 @@ function renderTable(){
     const v=normalizeCfg(vr);
     rows.push({
       coinType:k, sellPct:v.sellPercent, cooldownMs:v.cooldownMs, slipBps:v.slippageBps,
+      minBuySui: fromMistToSuiFloat(getActiveMinBuyMistRaw(v)),
       running:!!v.running, lastSell:v.lastSellMs? new Date(v.lastSellMs).toLocaleTimeString():'-',
       tpRunning:!!v.tpRunning, tpPriceSui:v.tpPriceSui, tpSellPct:v.tpSellPercent
     });
@@ -1056,6 +1132,8 @@ async function menu(){
         {name:'⚡ Auto-sell GLOBAL ON/OFF (multi token)', value:'toggle_global'},
         {name:'🎯 Set TP Harga & Sell %', value:'set_tp'},
         {name:'🎯 Auto-TP ON/OFF (harga target)', value:'toggle_tp'},
+        {name:'🌐 Atur ambang BUY (SUI) — GLOBAL', value:'global_min_buy_set'},
+        {name:`🌐 Mode GLOBAL ambang BUY: ${GLOBAL.useGlobalMin ? 'ON' : 'OFF'}`, value:'global_min_buy_toggle'},
         {name:'📋 Lihat status token', value:'list'},
         {name:'📜 Lihat activity.log (last 200)', value:'log'},
         {name:'Keluar', value:'exit'},
@@ -1105,6 +1183,7 @@ async function menu(){
         await startAutoSell(key);
       } else {
         await stopAutoSell(key);
+        await saveTokens();
       }
     }
 
@@ -1133,7 +1212,32 @@ async function menu(){
         await startAutoTP(key);
       } else {
         await stopAutoTP(key);
+        await saveTokens();
       }
+    }
+
+    if(action==='global_min_buy_set'){
+      const {sui} = await inquirer.prompt([{
+        name:'sui',
+        message:`Set ambang GLOBAL (SUI) [saat ini: ${fromMistToSuiFloat(GLOBAL.minBuyMistRaw)}]`,
+        default: fromMistToSuiFloat(GLOBAL.minBuyMistRaw),
+        filter: Number
+      }]);
+      const raw = toMistRawFromSuiFloat(sui);
+      GLOBAL.minBuyMistRaw = raw;
+      for (const [k, v0] of TOKENS){
+        const v = normalizeCfg(v0);
+        v.minBuyMistRaw = raw;
+        TOKENS.set(k, v);
+      }
+      await saveTokens();
+      console.log(`Ambang GLOBAL diset ke ${fromMistToSuiFloat(raw)} SUI dan diterapkan ke semua token.`);
+    }
+
+    if(action==='global_min_buy_toggle'){
+      GLOBAL.useGlobalMin = !GLOBAL.useGlobalMin;
+      await saveTokens();
+      console.log(`Mode GLOBAL ambang BUY sekarang: ${GLOBAL.useGlobalMin ? 'ON' : 'OFF'}.`);
     }
 
     if(action==='list') renderTable();
